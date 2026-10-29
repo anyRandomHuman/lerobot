@@ -3431,6 +3431,10 @@ def test_single_example_image_inputs_export(monkeypatch):
     assert torch.equal(token_pooling, torch.tensor([[[0, 1], [2, -1], [4, 9], [11, -1]]]))
     program = torch.export.export(embed, example, strict=False)
 
+    for node in program.graph.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            assert all(isinstance(size, int) for size in value.shape), node.format_node()
     with torch.no_grad():
         embeddings = embed(*example)
         # Reference: each image feature added to its image patch token, in order.
@@ -3471,6 +3475,12 @@ def test_single_example_image_inputs_export(monkeypatch):
         strided_bf16 = embed(example[0], strided, *example[2:])
     assert torch.equal(strided_bf16, contiguous_bf16)
 
+    # A single example keeps every pooling row, so a row with no patch must fail instead of pooling nothing.
+    padding_row = example[2].clone()
+    padding_row[1] = -1
+    with pytest.raises(RuntimeError, match="row with no patch"):
+        embed(*example[:2], padding_row, *example[3:])
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Checks the exported program on CUDA.")
 def test_single_example_image_inputs_export_on_cuda():
@@ -3487,6 +3497,18 @@ def test_single_example_image_inputs_export_on_cuda():
     with pytest.raises(RuntimeError, match="Image patch tokens"):
         program(missing_patch, *cuda_example[1:])
     torch.testing.assert_close(program(*cuda_example).cpu(), embeddings)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Moves the text embeddings to CUDA.")
+def test_image_features_follow_text_embeddings_device():
+    model = _tiny_molmoact2_model()
+    example = _two_image_example()
+    with torch.no_grad():
+        embeddings = _ImageEmbeddings(model)(*example)
+        # Accelerate can return the text embeddings on a different device from input_ids.
+        model.transformer.wte.register_forward_hook(lambda module, args, output: output.cuda())
+        split = _ImageEmbeddings(model)(*example)
+    assert torch.equal(split.cpu(), embeddings)
 
 
 def test_rtc_generation_uses_previous_chunk_prefix():
