@@ -1928,6 +1928,37 @@ def test_groot_n1_7_vlm_encode_builds_frames_on_target_device(device):
             )
 
 
+@pytest.mark.parametrize("saved_device", ["cuda", "mps"])
+def test_groot_n1_7_vlm_encode_runs_on_the_cpu_where_its_saved_device_is_missing(monkeypatch, saved_device):
+    # A checkpoint trained on a GPU or a Mac saves this step with that device and may load without it.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    class FakeProcessor:
+        def __init__(self):
+            self.image_devices = None
+
+        def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+            return conversation[0]["content"][-1]["text"]
+
+        def __call__(self, text, images, return_tensors, padding):
+            self.image_devices = {image.device.type for image in images}
+            return {"input_ids": torch.zeros(len(text), 1, dtype=torch.long)}
+
+    fake_proc = FakeProcessor()
+    step = GrootN17VLMEncodeStep(device=saved_device)
+    step._proc = fake_proc
+    transition = {
+        TransitionKey.OBSERVATION: {"video": np.zeros((1, 1, 1, 2, 2, 3), dtype=np.uint8)},
+        TransitionKey.COMPLEMENTARY_DATA: {"language": ["task"]},
+    }
+
+    output = step(transition)
+
+    assert fake_proc.image_devices == {"cpu"}
+    assert output[TransitionKey.COMPLEMENTARY_DATA]["input_ids"].shape == (1, 1)
+
+
 @pytest.mark.parametrize(
     "device",
     [
