@@ -18,6 +18,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from queue import Empty
 from threading import Event
@@ -170,8 +171,12 @@ class EnvServer:
         self.stop = Event()
         self.descriptor: EnvDescriptor
 
-    def serve(self) -> None:
-        """Answer requests until ``stop`` is set. Every simulator call happens on this thread."""
+    def serve(self, should_stop: Callable[[], bool] | None = None) -> None:
+        """Answer requests until stopped. Every simulator call happens on this thread.
+
+        ``should_stop`` lets the owner check a signal flag without acquiring a lock
+        inside the signal handler. Other threads can continue to use ``stop.set()``.
+        """
         try:
             # Open the transport first, so clients that connect while a slow simulator starts wait
             # instead of failing.
@@ -200,7 +205,7 @@ class EnvServer:
                 ", ".join(zenoh.listen_endpoints or zenoh.connect_endpoints),
             )
             self.ready.set()
-            while not self.stop.is_set():
+            while not self.stop.is_set() and not (should_stop is not None and should_stop()):
                 for channel in (describe, any_describe, requests):
                     for _ in range(8):
                         try:
