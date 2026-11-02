@@ -27,17 +27,21 @@ import dataclasses
 import logging
 import os
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, Unpack
 
+import httpx
 import torch
-from huggingface_hub import hf_hub_download
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
+from huggingface_hub.constants import CONFIG_NAME, SAFETENSORS_SINGLE_FILE
+from huggingface_hub.errors import HfHubHTTPError, HFValidationError
+from safetensors import safe_open
 from torch import Tensor
 
-from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.import_utils import _transformers_available, require_package
 
@@ -45,6 +49,8 @@ from ..chunk import ChunkPolicySpec
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..utils import get_device_from_parameters
 from .configuration_groot import (
+    _BASE_CONFIG_DIR,
+    _BASE_CONFIG_FILES,
     GROOT_N1_5,
     GROOT_N1_5_REMOVAL_GUIDANCE,
     GROOT_N1_7,
@@ -52,8 +58,9 @@ from .configuration_groot import (
     infer_groot_model_version,
     infer_groot_n1_7_action_execution_horizon,
     infer_groot_n1_7_action_horizon,
+    resolve_groot_base_config_path,
 )
-from .groot_n1_7 import GR00TN17, _tie_unused_qwen_lm_head
+from .groot_n1_7 import GR00TN17, GR00TN17Config, _tie_unused_qwen_lm_head
 
 if TYPE_CHECKING or _transformers_available:
     from transformers.trainer_pt_utils import get_parameter_names
@@ -63,6 +70,41 @@ else:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="GrootPolicy")
+
+# The LM head is tied to the input embedding, so a saved checkpoint holds only one of the two names.
+_TIED_WEIGHT_NAMES = (
+    "backbone.model.lm_head.weight",
+    "backbone.model.model.language_model.embed_tokens.weight",
+)
+
+
+def _link_root(folder: Path) -> Path | None:
+    """Return the folder that the files read from `folder` must resolve into to be copied, or None for none."""
+    real = folder.resolve()
+    if folder.name == _BASE_CONFIG_DIR and not real.is_relative_to(folder.parent.resolve()):
+        # A checkpoint's copies folder that links out of the checkpoint.
+        return None
+    for snapshot in (real, *real.parents):
+        repo = snapshot.parent.parent
+        if (
+            snapshot.parent.name == "snapshots"
+            and repo.name.startswith("models--")
+            and (repo / "blobs").is_dir()
+        ):
+            # The Hugging Face cache links the files of a snapshot into the blobs folder of its repo.
+            return repo
+    return real
+
+
+@contextmanager
+def _weight_source(config: GrootConfig, checkpoint: Path | None) -> Iterator[None]:
+    """Point pretrained_path at the checkpoint a policy loads while it is built, as make_policy does."""
+    parent = config.pretrained_path
+    config.pretrained_path = checkpoint
+    try:
+        yield
+    finally:
+        config.pretrained_path = parent
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -75,43 +117,73 @@ class GrootPolicy(PreTrainedPolicy):
     def supports_rtc(self) -> bool:
         return True
 
-    def __init__(self, config: GrootConfig, **kwargs):
+    def __init__(self, config: GrootConfig, *, _groot_model: GR00TN17 | None = None, **kwargs):
         """Initialize Groot policy wrapper."""
         require_package("transformers", extra="groot")
         super().__init__(config)
         config.validate_features()
         self.config = config
+        # The copies of the local checkpoint that pretrained_path names, else the base model. While
+        # from_pretrained builds the policy, pretrained_path names the folder of the checkpoint it loads.
+        self._base_config_path = resolve_groot_base_config_path(
+            config.pretrained_path, config.base_model_path
+        )
 
-        # Initialize GR00T model using ported components
-        self._groot_model = self._create_groot_model()
+        # Initialize GR00T model using ported components, unless from_pretrained built it from a checkpoint.
+        self._groot_model = self._create_groot_model() if _groot_model is None else _groot_model
+        # Read once here, as a save must not depend on the base model still being reachable.
+        self._base_config_files = self._read_base_config_files(self._base_config_path)
+        # The horizons are saved with the config, so loading a checkpoint needs no base model files for them.
+        # Each embodiment has its own, so they are read again for another tag.
+        if (
+            config.embodiment_action_horizon is None
+            or config.embodiment_horizons_tag != config.embodiment_tag
+        ):
+            config.embodiment_action_horizon = infer_groot_n1_7_action_horizon(
+                self._base_config_path, config.embodiment_tag
+            )
+            config.embodiment_execution_horizon = infer_groot_n1_7_action_execution_horizon(
+                self._base_config_path, config.embodiment_tag
+            )
+            config.embodiment_horizons_tag = config.embodiment_tag
         self._action_queue_steps = self._resolve_action_queue_steps()
         self._warned_native_relative_rtc_prefix_disabled = False
 
         self.reset()
 
-    def _create_groot_model(self):
-        """Create and initialize the GR00T N1.7 model using the ported components."""
-        model_kwargs = {
-            "pretrained_model_name_or_path": self.config.base_model_path,
-            "tune_llm": self.config.tune_llm,
-            "tune_visual": self.config.tune_visual,
-            "tune_projector": self.config.tune_projector,
-            "tune_diffusion_model": self.config.tune_diffusion_model,
-            # Forwarded as a GR00TN17Config override; read back by set_trainable_parameters.
-            "tune_top_llm_layers": self.config.tune_top_llm_layers,
-            "use_flash_attention": self.config.use_flash_attention,
+    @staticmethod
+    def _groot_tuning_kwargs(config: GrootConfig) -> dict[str, bool]:
+        return {
+            "tune_llm": config.tune_llm,
+            "tune_visual": config.tune_visual,
+            "tune_projector": config.tune_projector,
+            "tune_diffusion_model": config.tune_diffusion_model,
+            "tune_vlln": config.tune_vlln,
+        }
+
+    @staticmethod
+    def _groot_config_overrides(config: GrootConfig) -> dict[str, Any]:
+        overrides: dict[str, Any] = {
+            # Read back by set_trainable_parameters.
+            "tune_top_llm_layers": config.tune_top_llm_layers,
+            "use_flash_attention": config.use_flash_attention,
         }
         # Surface the inference-time knobs onto the model config only when the user set them; None
         # leaves the value baked into the checkpoint untouched.
-        if self.config.num_inference_timesteps is not None:
-            model_kwargs["num_inference_timesteps"] = self.config.num_inference_timesteps
-        if self.config.rtc_ramp_rate is not None:
-            model_kwargs["rtc_ramp_rate"] = self.config.rtc_ramp_rate
+        if config.num_inference_timesteps is not None:
+            overrides["num_inference_timesteps"] = config.num_inference_timesteps
+        if config.rtc_ramp_rate is not None:
+            overrides["rtc_ramp_rate"] = config.rtc_ramp_rate
+        return overrides
 
+    def _create_groot_model(self) -> GR00TN17:
+        """Create and initialize the GR00T N1.7 model using the ported components."""
         model = GR00TN17.from_pretrained(
-            **model_kwargs,
-            tune_vlln=self.config.tune_vlln,
-            transformers_loading_kwargs={"trust_remote_code": True},
+            pretrained_model_name_or_path=self.config.base_model_path,
+            # The same files the horizon reads and a save writes, so a save describes the model built here.
+            config=self._base_config_path,
+            **self._groot_config_overrides(self.config),
+            **self._groot_tuning_kwargs(self.config),
         )
         backbone = getattr(model, "backbone", None)
         qwen_model = getattr(backbone, "model", None)
@@ -126,6 +198,81 @@ class GrootPolicy(PreTrainedPolicy):
         for parameter in model.parameters():
             if parameter.is_floating_point():
                 parameter.data = parameter.data.to(torch.float32)
+
+    @classmethod
+    def _build_groot_model_from_checkpoint(
+        cls, config: GrootConfig, model_file: str, base_config_path: str | None
+    ) -> GR00TN17 | None:
+        """Build GR00T from a fine-tuned checkpoint without downloading or loading NVIDIA's base weights.
+
+        Reads only NVIDIA's config files. Returns None when the checkpoint does not match what the regular path
+        builds, so the caller loads it the regular way.
+        """
+        require_package("transformers", extra="groot")
+        if config.device is None:
+            raise ValueError(f"{type(config).__name__}.device is unset; cannot load the weights")
+        # The constructor checks this too, but here it runs before the model is built.
+        config.validate_features()
+        prefix = "_groot_model."
+        with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+            keys = list(checkpoint.keys())
+            if not all(key.startswith(prefix) for key in keys):
+                logger.warning("Checkpoint holds weights outside GR00T; loading the base weights first.")
+                return None
+            # Views of the memory-mapped file, so transformers converts them to each parameter's dtype one
+            # tensor at a time, instead of the whole checkpoint being copied first.
+            state_dict = {key.removeprefix(prefix): checkpoint.get_tensor(key) for key in keys}
+            lm_head, embedding = _TIED_WEIGHT_NAMES
+            if lm_head in state_dict and embedding in state_dict:
+                # A save keeps one name of a tied pair. Both names are unusual, and a strict regular load
+                # rejects the extra one, so the regular load decides.
+                logger.warning("Checkpoint holds both tied weight names; loading the base weights first.")
+                return None
+            if lm_head in state_dict:
+                state_dict[embedding] = state_dict[lm_head]
+            elif embedding in state_dict:
+                state_dict[lm_head] = state_dict[embedding]
+
+            groot_config = GR00TN17Config.from_pretrained(
+                base_config_path, **cls._groot_config_overrides(config)
+            )
+            if config.dtype != torch.float32 and groot_config.dtype is None:
+                # "auto" then falls back to the dtype of the base weights, which only the regular path reads.
+                logger.warning("Base config does not name a dtype; loading the base weights first.")
+                return None
+            model = GR00TN17.from_pretrained(
+                pretrained_model_name_or_path=None,
+                config=groot_config,
+                state_dict=state_dict,
+                # Weights take the dtype their parameters are built in, so build in fp32 for fp32 parameters.
+                dtype=torch.float32 if config.dtype == torch.float32 else "auto",
+                # A shape mismatch is detected below and sent down the regular path, like a key mismatch.
+                ignore_mismatched_sizes=True,
+                **cls._groot_tuning_kwargs(config),
+            )
+            shapes = {name: tensor.shape for name, tensor in model.state_dict().items()}
+            if shapes != {name: tensor.shape for name, tensor in state_dict.items()}:
+                logger.warning("Checkpoint keys or shapes differ from GR00T; loading the base weights first.")
+                return None
+            # With `load_bf16`, the backbone still builds what its base config freezes in bfloat16, which
+            # rounds a fp32 checkpoint. The regular path casts to fp32 before loading, so it stays exact.
+            if config.dtype == torch.float32 and any(
+                parameter.is_floating_point() and parameter.dtype != torch.float32
+                for parameter in model.parameters()
+            ):
+                logger.warning("Base config builds some weights in bfloat16; loading the base weights first.")
+                return None
+            # Tie first so the shared weight is copied once. Weights that kept their dtype still point into
+            # the file, so copy each one out before moving it: a device copy straight from the file is slow
+            # and keeps its pages as private memory on Jetson. Weights converted to another dtype are copies.
+            _tie_unused_qwen_lm_head(model.backbone.model)
+            in_file = {tensor.untyped_storage().data_ptr() for tensor in state_dict.values()}
+            for tensor in (*model.parameters(), *model.buffers()):
+                data = tensor.data
+                if data.untyped_storage().data_ptr() in in_file:
+                    data = data.clone()
+                tensor.data = data.to(config.device)
+        return model
 
     @staticmethod
     def _build_weight_decay_parameter_groups(model: torch.nn.Module) -> list[dict[str, Any]]:
@@ -156,6 +303,62 @@ class GrootPolicy(PreTrainedPolicy):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self._action_queue_steps)
 
+    @staticmethod
+    def _read_base_config_files(base_config_path: str | None) -> dict[str, bytes]:
+        if base_config_path is None:
+            return {}
+        if os.path.isdir(base_config_path):
+            folder = Path(base_config_path)
+            files = [folder / name for name in _BASE_CONFIG_FILES if (folder / name).is_file()]
+            # A save writes these files into the next checkpoint, so a link out of the folder is not followed.
+            # It copies all of them or none, as a copy marked complete must hold every file that loading read.
+            root = _link_root(folder)
+            if any(root is None or not path.resolve().is_relative_to(root) for path in files):
+                logger.warning("A file in %s links outside it, so a save copies no base config.", folder)
+                return {}
+        else:
+            # Only config.json, as a Hub base model's processor_config.json is never read. Building the model
+            # already downloaded it, so the cache has it.
+            try:
+                cached = try_to_load_from_cache(base_config_path, CONFIG_NAME)
+            except HFValidationError:
+                # Neither a folder nor a repo id, for example a folder on another machine.
+                cached = None
+            files = [Path(cached)] if isinstance(cached, str) else []
+        return {file.name: file.read_bytes() for file in files if file.is_file()}
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        """Save the policy, plus the base model config files that loading it reads."""
+        from lerobot.distributed.utils import is_main_process
+
+        target = save_directory / _BASE_CONFIG_DIR
+        if is_main_process():
+            # Replaced, not written through, as the folder it links to may hold another checkpoint's copies.
+            if target.is_symlink():
+                target.unlink()
+            # Removed before the weights are written and written last, so a save that stops halfway leaves no
+            # copies that loading would use with the new weights.
+            (target / CONFIG_NAME).unlink(missing_ok=True)
+        super()._save_pretrained(save_directory)
+        if not is_main_process():
+            return
+        target.mkdir(exist_ok=True)
+        for name in _BASE_CONFIG_FILES:
+            # Also drops a link, or a copy an earlier save left, instead of writing through it or keeping it.
+            (target / name).unlink(missing_ok=True)
+            if name in self._base_config_files:
+                (target / name).write_bytes(self._base_config_files[name])
+
+    def push_to_hub(
+        self, repo_id: str, *, delete_patterns: list[str] | str | None = None, **kwargs: Any
+    ) -> str | None:
+        """Push the policy, deleting the base config copies in the repo that this push does not upload."""
+        if isinstance(delete_patterns, str):
+            delete_patterns = [delete_patterns]
+        return super().push_to_hub(
+            repo_id, delete_patterns=[*(delete_patterns or []), f"{_BASE_CONFIG_DIR}/*"], **kwargs
+        )
+
     @classmethod
     def from_pretrained(
         cls: builtins.type[T],
@@ -177,6 +380,9 @@ class GrootPolicy(PreTrainedPolicy):
         Handles two cases:
         1. Base GR00T N1.7 models - loads the raw model
         2. Fine-tuned LeRobot checkpoints - loads config and weights from safetensors
+
+        While the policy is built, config.pretrained_path names the local folder of the checkpoint it loads
+        (None for a base model), as in make_policy.
 
         Args:
             pretrained_name_or_path: Path to the GR00T model or fine-tuned checkpoint
@@ -203,20 +409,22 @@ class GrootPolicy(PreTrainedPolicy):
 
         model_id = str(pretrained_name_or_path)
         is_finetuned_checkpoint = False
+        model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
 
         # Check if this is a fine-tuned LeRobot checkpoint (has model.safetensors)
         try:
             if os.path.isdir(model_id):
-                is_finetuned_checkpoint = os.path.exists(os.path.join(model_id, SAFETENSORS_SINGLE_FILE))
+                is_finetuned_checkpoint = os.path.exists(model_file)
             else:
                 # Try to download the safetensors file to check if it exists
                 try:
-                    hf_hub_download(
+                    model_file = hf_hub_download(
                         repo_id=model_id,
                         filename=SAFETENSORS_SINGLE_FILE,
                         revision=revision,
                         cache_dir=cache_dir,
-                        force_download=False,  # Just check, don't force download
+                        # Every load below reads this file, so only this download honors force_download.
+                        force_download=force_download,
                         token=token,
                         local_files_only=local_files_only,
                     )
@@ -227,21 +435,67 @@ class GrootPolicy(PreTrainedPolicy):
             is_finetuned_checkpoint = False
 
         if is_finetuned_checkpoint:
-            # This is a fine-tuned LeRobot checkpoint - use parent class loading
             logger.info("Detected fine-tuned LeRobot checkpoint, loading with state dict...")
-            return super().from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                config=config,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                strict=strict,
-                **kwargs,
-            )
+            if config is None:
+                config = PreTrainedConfig.from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                    **kwargs,
+                )
+            checkpoint = Path(model_file).parent
+            if not os.path.isdir(model_id):
+                # Into the snapshot folder that holds the weights file found above, from its commit. Offline,
+                # snapshot_download fails for a commit even when the copies are cached, so they are looked for
+                # below.
+                with suppress(OSError, httpx.HTTPError):
+                    snapshot_download(
+                        repo_id=model_id,
+                        allow_patterns=[f"{_BASE_CONFIG_DIR}/{name}" for name in _BASE_CONFIG_FILES],
+                        revision=checkpoint.name,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        token=token,
+                        local_files_only=local_files_only,
+                    )
+            base_config_path = resolve_groot_base_config_path(checkpoint, config.base_model_path)
+            if base_config_path == config.base_model_path and not os.path.isdir(model_id):
+                # An older checkpoint has no copies, and an offline cache may lack them.
+                logger.warning("No base config copies for %s; reading base_model_path.", model_id)
+            # Every way of building the policy below, a subclass's too, reads the base config files there.
+            with _weight_source(config, checkpoint):
+                if cls is GrootPolicy:
+                    groot_model = cls._build_groot_model_from_checkpoint(config, model_file, base_config_path)
+                    if groot_model is not None:
+                        policy = cls(config, _groot_model=groot_model, **kwargs)
+                        policy.to(config.device)
+                        policy.eval()
+                        return policy
+                else:
+                    # A subclass may build its own model or add weights, so it keeps the regular load.
+                    logger.warning(
+                        "%s is a subclass, so it builds its own model from the base weights before loading.",
+                        cls.__name__,
+                    )
+                return super().from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    config=config,
+                    # The files were downloaded above, so a forced download would fetch them twice.
+                    force_download=False,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                    strict=strict,
+                    **kwargs,
+                )
 
         # This is a base GR00T model - load it fresh
         logger.info("Detected base GR00T model, loading from HuggingFace...")
@@ -269,6 +523,8 @@ class GrootPolicy(PreTrainedPolicy):
         else:
             # Override the base_model_path with the provided path
             config.base_model_path = str(pretrained_name_or_path)
+            # The config may hold the horizons of another model, so they are read from this one.
+            config.embodiment_horizons_tag = None
             if field_kwargs:
                 config = dataclasses.replace(config, **field_kwargs)
 
@@ -282,8 +538,10 @@ class GrootPolicy(PreTrainedPolicy):
                 message = f"{message} {GROOT_N1_5_REMOVAL_GUIDANCE}"
             raise ValueError(message)
         # Create a fresh policy instance - this will automatically load the GR00T model
-        # in __init__ via _create_groot_model()
-        policy = cls(config)
+        # in __init__ via _create_groot_model(). It is built from the base model alone, not from the base
+        # config copies of a checkpoint the config names.
+        with _weight_source(config, None):
+            policy = cls(config)
 
         policy.eval()
         return policy
@@ -294,14 +552,8 @@ class GrootPolicy(PreTrainedPolicy):
 
     def _resolve_action_queue_steps(self) -> int:
         n_action_steps = int(self.config.n_action_steps)
-        checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
-            self.config.base_model_path,
-            self.config.embodiment_tag,
-        )
-        execution_horizon = infer_groot_n1_7_action_execution_horizon(
-            self.config.base_model_path,
-            self.config.embodiment_tag,
-        )
+        checkpoint_action_horizon = self.config.embodiment_action_horizon
+        execution_horizon = self.config.embodiment_execution_horizon
         horizons = [n_action_steps]
         if checkpoint_action_horizon is not None:
             horizons.append(checkpoint_action_horizon)
@@ -326,10 +578,7 @@ class GrootPolicy(PreTrainedPolicy):
         """Apply the same checkpoint and playback bounds before and after inference."""
 
         horizons = [available_steps]
-        checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
-            self.config.base_model_path,
-            self.config.embodiment_tag,
-        )
+        checkpoint_action_horizon = self.config.embodiment_action_horizon
         if checkpoint_action_horizon is not None:
             horizons.append(checkpoint_action_horizon)
 
