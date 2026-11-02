@@ -167,11 +167,6 @@ initial plan automatically based on executor size, migrate a running task,
 or split an episode between workers. Local subprocess tests exercise dynamic
 scheduling; multi-node Ray/Daft execution has not been validated.
 
-This PR does not include a Ray/Daft executor or an HDF5 conversion adapter.
-For one HDF5 file per episode, an adapter can map task episode indices to source
-files and provide lazy frame iterators to `write_distributed_shard()`. It must
-also dispatch every continuation before the driver commits the dataset.
-
 Pending-task discovery currently revalidates completed artifacts, including
 their checksums, on each scan. Its cost grows with completed data; large-scale
 scheduling throughput has not been benchmarked.
