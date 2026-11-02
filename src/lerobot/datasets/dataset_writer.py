@@ -42,7 +42,7 @@ from lerobot.configs import (
 
 from .compute_stats import compute_episode_stats
 from .dataset_metadata import LeRobotDatasetMetadata
-from .distributed import DistributedEpisodeResult, DistributedEpisodeSpec
+from .distributed import DistributedEpisodeResult, DistributedEpisodeSpec, artifact_digest
 from .feature_utils import (
     get_hf_features_from_features,
     validate_episode_buffer,
@@ -79,8 +79,9 @@ def _encode_video_worker(
     fps: int,
     video_encoder: VideoEncoderConfig | None = None,
     encoder_threads: int | None = None,
+    temporary_root: Path | None = None,
 ) -> Path:
-    temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
+    temp_path = Path(tempfile.mkdtemp(dir=temporary_root or root)) / f"{video_key}_{episode_index:03d}.mp4"
     path_template = (
         DEFAULT_DEPTH_PATH
         if video_encoder is not None and isinstance(video_encoder, DepthEncoderConfig)
@@ -510,6 +511,11 @@ class DatasetWriter:
             self.episode_buffer = self._create_episode_buffer(spec.episode_index)
             self._distributed_episode_started = False
             raise
+        finally:
+            shutil.rmtree(
+                self._root / ".distributed-video-tmp" / f"episode-{spec.episode_index:06d}",
+                ignore_errors=True,
+            )
 
         if self._meta.image_keys:
             self._delete_camera_frame_dirs(self._meta.image_keys)
@@ -527,6 +533,9 @@ class DatasetWriter:
             video_metadata=video_metadata,
             video_info=video_info,
             stats=stats,
+            artifact_digests={
+                str(path.relative_to(self._root)): artifact_digest(path) for path in [data_path, *video_paths]
+            },
             depth_units={
                 key: self._meta.features[key]["info"]["depth_unit"]
                 for key in self._meta.depth_keys
@@ -785,6 +794,10 @@ class DatasetWriter:
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """Use ffmpeg to convert frames stored as png/tiff into mp4 videos."""
         is_depth = video_key in self._meta.depth_keys
+        temporary_root = None
+        if self._distributed_episode_started:
+            temporary_root = self._root / ".distributed-video-tmp" / f"episode-{episode_index:06d}"
+            temporary_root.mkdir(parents=True, exist_ok=True)
         return _encode_video_worker(
             video_key,
             episode_index,
@@ -792,6 +805,7 @@ class DatasetWriter:
             self._meta.fps,
             self._depth_encoder if is_depth else self._rgb_encoder,
             self._encoder_threads,
+            temporary_root=temporary_root,
         )
 
     def close_writer(self) -> None:

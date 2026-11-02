@@ -4,16 +4,15 @@ LeRobot Dataset v3.0 supports controlled distributed **writing**.
 
 ## Supported Modes
 
-- Distributed writes support a new empty dataset, one driver, and one or more workers that share the target storage.
+- Distributed writes support a new or existing dataset, one driver, and one or more workers that share the target storage.
 
-Distributed writes do not support concurrent append to an existing dataset, two drivers, or mixing `save_episode()` with distributed workers.
+An existing dataset can be extended with new episodes, but it must not change after the driver creates the plan. Distributed writes do not support two drivers or mixing `save_episode()` with active distributed workers.
 
 ## Distributed Writes
 
 The driver allocates every episode and output file before any worker writes data. A worker owns exactly one `DistributedEpisodeSpec`, writes its own Parquet and MP4 files, and returns a result. Only the driver publishes `meta/`.
 
 ```python
-from lerobot.datasets.distributed import DistributedWritePlan
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 driver = LeRobotDataset.create(
@@ -23,11 +22,9 @@ driver = LeRobotDataset.create(
     root="/shared/assembled-dataset",
 )
 
-plan = DistributedWritePlan.from_episode_lengths(
+plan = driver.create_distributed_write_plan(
     episode_lengths=[len(frames) for frames in all_episodes],
     episode_tasks=[[frame["task"] for frame in frames] for frames in all_episodes],
-    chunks_size=driver.meta.chunks_size,
-    video_keys=list(driver.meta.video_keys),
 )
 
 def write_episode(spec, frames):
@@ -52,7 +49,19 @@ driver.finalize()
 
 `start_distributed_episode(spec)` is required before the first `add_frame()`. It assigns the worker's temporary camera directory to the planned episode, preventing video-frame staging collisions.
 
-Each distributed episode receives a unique data file and, for each video feature, a unique MP4 file. This avoids distributed file locks and makes an individual failed worker retryable.
+Each distributed episode receives a unique data file and, for each video feature, a unique MP4 file. Workers writing different episodes do not contend for a shared output file. Use the persistent session described below when the scheduler may retry workers.
+
+To append to an existing local dataset, open the driver in write mode before creating the plan:
+
+```python
+driver = LeRobotDataset.resume(REPO_ID, root=ROOT)
+plan = driver.create_distributed_write_plan(
+    episode_lengths=[len(frames) for frames in new_episodes],
+    episode_tasks=[[frame["task"] for frame in frames] for frames in new_episodes],
+)
+```
+
+The driver starts episode and frame ranges after the currently published totals, preserves existing task indices, and allocates files after every occupied data, video, and episode-metadata file. Commit merges the previous tasks, statistics, and episode metadata with the new worker results.
 
 ## Multiprocessing and Ray
 
@@ -93,8 +102,8 @@ LeRobot does not import or require Ray; Ray is only one possible scheduler.
 ### Complete Ray Write Example
 
 The following script creates a small dataset using two or more Ray workers. The
-driver creates the empty dataset and the plan, workers write only their assigned
-episodes, and the driver publishes the metadata after every worker succeeds.
+driver creates the dataset and allocates the plan, workers write only their
+assigned episodes, and the driver publishes the metadata after every worker succeeds.
 
 All Ray workers must be able to read and write the same `ROOT` directory. The
 current API persists and validates filesystem paths, so `ROOT` must also have
@@ -110,7 +119,6 @@ from pathlib import Path
 import numpy as np
 import ray
 
-from lerobot.datasets.distributed import DistributedWritePlan
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 REPO_ID = "my-org/distributed-demo"
@@ -162,8 +170,7 @@ def write_one_episode(spec, frames, session):
 def main():
     ray.init(address="auto")
 
-    # Only the driver creates the dataset. Distributed writes require it to be
-    # a newly created, empty dataset.
+    # The driver can create a new dataset or resume an existing local dataset.
     driver = LeRobotDataset.create(
         REPO_ID,
         root=ROOT,
@@ -174,14 +181,12 @@ def main():
 
     # Allocate global frame indexes, task indexes, and unique chunk/file paths
     # before starting any worker.
-    plan = DistributedWritePlan.from_episode_lengths(
+    plan = driver.create_distributed_write_plan(
         episode_lengths=[len(episode) for episode in EPISODES],
         episode_tasks=[
             [frame["task"] for frame in episode]
             for episode in EPISODES
         ],
-        chunks_size=driver.meta.chunks_size,
-        video_keys=list(driver.meta.video_keys),
     )
     session = driver.create_distributed_write_session(plan)
 
@@ -192,8 +197,8 @@ def main():
         ]
     )
 
-    # Only the driver commits: it validates all returned artifacts and atomically
-    # makes the global meta/ directory visible.
+    # Only the driver commits: it validates the artifacts and publishes meta/
+    # with a recovery journal and a receipt for idempotent retries.
     driver.commit_distributed_results(session.plan, session.load_results())
     driver.finalize()
 
@@ -210,9 +215,8 @@ python distributed_write_ray.py
 ```
 
 For a remote driver, use `ray.init(address="auto")` and submit the same script
-from a Ray Job or run it in the head pod. When the dataset includes video
-features, retain `video_keys=list(driver.meta.video_keys)` in the plan. Each
-worker then writes one independent MP4 for each video feature.
+from a Ray Job or run it in the head pod. Each worker writes one independent
+MP4 for each video feature selected automatically from the dataset schema.
 
 ## Failure Recovery
 
@@ -242,26 +246,59 @@ a valid result record and valid artifacts are omitted:
 ```python
 session = LeRobotDataset.resume_distributed_write_session(ROOT)
 
-# Do not automatically delete files. Call this explicit recovery operation if
-# an interrupted worker left an unrecorded, missing, or corrupt planned output.
+# Optional: clean interrupted outputs before enumerating pending episodes.
+# Session-aware start_distributed_episode() also cleans its own episode.
+# Stop active workers before running this global cleanup.
 session.cleanup_orphaned_artifacts()
 
 for spec in session.pending_specs():
     submit_to_your_scheduler(spec, session=session)
 
 # When no spec remains pending, load both old and newly persisted results.
+driver = LeRobotDataset.resume(REPO_ID, root=ROOT)
 driver.commit_distributed_results(session.plan, session.load_results())
 driver.finalize()
 ```
 
-`cleanup_orphaned_artifacts()` only removes output paths allocated to specs that
-do not have a valid persistent success record. It preserves artifacts referenced
-by a record whose data Parquet, frame range, episode index, and video outputs
-all validate. This makes an explicit retry safe after a process is killed
-between writing a file and recording success.
+With a session, `start_distributed_episode()` acquires an exclusive lock for its
+episode. If the previous attempt completed, the worker reuses its verified
+result: `add_frame()` does not write the supplied frames and
+`save_distributed_episode()` returns the recorded result. A spec identifies one
+immutable episode; changing its input requires a new plan, not a retry. If the
+previous attempt left incomplete or corrupt outputs, the worker removes only
+that episode's allocated artifacts and temporary files before rewriting it.
+
+A duplicate attempt or cleanup operation raises `filelock.Timeout` while another
+process owns the episode. The scheduler may retry after that process finishes
+or exits. The lock files remain outside the disposable session directory so
+retries cannot acquire different locks for the same episode.
+
+`cleanup_orphaned_artifacts()` applies the same validation and cleanup to the
+whole plan. Completed results are checked against their Parquet frame ranges,
+episode indices, video metadata, and SHA-256 artifact digests. Corrupt result
+records make `load_results()` and `pending_specs()` fail until cleanup or a
+session-aware worker retry repairs them. Writers opened without a session keep
+the basic protocol and do not provide automatic retry or attempt exclusion.
+
+After a successful commit and metadata reload, the matching session directory
+is removed so the driver can plan another distributed append batch. Failed or
+interrupted commits retain the session for recovery.
+
+Metadata publication records a recovery journal before moving the old and new
+`meta/` directories. Resume the session before reopening the driver after an
+interruption; this completes the interrupted publication. Metadata contains a
+commit receipt, so replaying the same plan and results succeeds without adding
+the episodes twice, including when the driver died after publication. Conflicting
+results for an already committed plan are rejected. A retained session object
+can also reuse the receipt after its active session directory has been removed.
+
+These guarantees cover process interruption. Publication uses two directory
+renames and can briefly leave `meta/` absent; concurrent readers during a write
+are not supported. This is not a transaction spanning all dataset files, nor a
+guarantee against filesystem or machine power loss.
 
 Do not call `commit_distributed_results()` until the session has one valid
-result for every plan entry. A rejected commit leaves the existing public
+result for every plan entry. A validation failure leaves the existing public
 `meta/` directory unchanged. Always retry with the original
 `DistributedEpisodeSpec`; do not create a replacement plan.
 
@@ -275,15 +312,17 @@ All workers and the driver need access to the same dataset root at the same
 absolute path. The storage must provide cross-node read-after-write visibility,
 concurrent creation of distinct planned Parquet/MP4 paths, atomic file
 replacement for session records, and atomic directory rename within the
-dataset root for final metadata publication. A read-write-many PVC, NFS, or a
+dataset root for final metadata publication. Session-aware workers additionally
+require cross-node advisory file locks that are released when a worker exits.
+A read-write-many PVC, NFS, or a
 filesystem-style object-store mount can be used only when it provides those
 semantics. Node-local disks, `emptyDir`, independent `hostPath` volumes, and
 direct object-store APIs without atomic rename do not satisfy this protocol.
 Do not assume that an object-store FUSE/CSI volume has these semantics merely
 because Kubernetes reports `ReadWriteMany`: verify immediate cross-node
-visibility for newly closed files and atomic replacement first.
+visibility for newly closed files, atomic replacement, and lock exclusion first.
 
-Use exactly one driver to create the empty dataset, allocate the plan, and
+Use exactly one driver to create or resume the dataset, allocate the plan, and
 publish `meta/`. Each `DistributedEpisodeSpec` may be owned by only one worker
 at a time. Workers may run in separate processes, pods, or machines, but they
 must not call `save_episode()` or write a spec assigned to another worker. A

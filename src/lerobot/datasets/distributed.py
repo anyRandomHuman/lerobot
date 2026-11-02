@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -31,6 +32,7 @@ import datasets
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from filelock import FileLock
 
 from lerobot.configs import DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT, is_depth_map
 from lerobot.utils.utils import flatten_dict
@@ -46,10 +48,46 @@ from .utils import (
     serialize_dict,
     update_chunk_file_indices,
 )
+from .video_utils import get_video_duration_in_s, get_video_info
 
 _SESSION_DIRECTORY = ".distributed-write-session"
 _PLAN_FILENAME = "plan.json"
 _RESULTS_DIRECTORY = "results"
+
+
+def artifact_digest(path: Path) -> str:
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def plan_digest(plan: DistributedWritePlan) -> str:
+    return hashlib.sha256(json.dumps(_serialize_plan(plan), sort_keys=True).encode()).hexdigest()
+
+
+def commit_receipt(root: Path, plan: DistributedWritePlan) -> Path:
+    return root / "meta" / "distributed-commits" / f"{plan_digest(plan)}.json"
+
+
+def result_digest(results: list[DistributedEpisodeResult]) -> str:
+    payload = [
+        _serialize_result(result) for result in sorted(results, key=lambda result: result.episode_index)
+    ]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def write_commit_receipt(
+    root: Path, plan: DistributedWritePlan, results: list[DistributedEpisodeResult]
+) -> None:
+    path = commit_receipt(root, plan)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    DistributedWriteSession._write_json_atomically(
+        path,
+        {
+            "plan": _serialize_plan(plan),
+            "digest": result_digest(results),
+            "results": [_serialize_result(result) for result in results],
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -86,6 +124,7 @@ class DistributedEpisodeResult:
     video_info: dict[str, dict[str, Any]]
     stats: dict[str, dict[str, Any]]
     depth_units: dict[str, str] = dataclass_field(default_factory=dict)
+    artifact_digests: dict[str, str] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,24 +144,45 @@ class DistributedWritePlan:
         episode_tasks: list[list[str]],
         chunks_size: int,
         video_keys: list[str] | None = None,
+        start_episode_index: int = 0,
+        start_dataset_index: int = 0,
+        start_chunk_index: int = 0,
+        start_file_index: int = 0,
+        task_to_index: dict[str, int] | None = None,
     ) -> DistributedWritePlan:
-        """Allocate contiguous global frame ranges and unique data files per episode."""
+        """Allocate contiguous global ranges and unique files for new or appended episodes."""
         if not episode_lengths:
             raise ValueError("A distributed write plan requires at least one episode.")
         if len(episode_lengths) != len(episode_tasks):
             raise ValueError("episode_lengths and episode_tasks must have the same length.")
         if chunks_size <= 0:
             raise ValueError("chunks_size must be positive.")
+        if start_episode_index < 0:
+            raise ValueError("start_episode_index must be non-negative.")
+        if start_dataset_index < 0:
+            raise ValueError("start_dataset_index must be non-negative.")
+        if start_chunk_index < 0:
+            raise ValueError("start_chunk_index must be non-negative.")
+        if not 0 <= start_file_index < chunks_size:
+            raise ValueError("start_file_index must be in the current chunk range.")
 
-        task_to_index: dict[str, int] = {}
+        task_mapping = dict(task_to_index or {})
+        if (
+            any(not isinstance(task, str) or not task for task in task_mapping)
+            or any(not isinstance(index, int) or index < 0 for index in task_mapping.values())
+            or sorted(task_mapping.values()) != list(range(len(task_mapping)))
+        ):
+            raise ValueError("task_to_index must contain non-empty tasks with contiguous unique indices.")
+
         episodes: list[DistributedEpisodeSpec] = []
-        dataset_from_index = 0
-        chunk_index = 0
-        file_index = 0
+        dataset_from_index = start_dataset_index
+        chunk_index = start_chunk_index
+        file_index = start_file_index
 
-        for episode_index, (episode_length, tasks) in enumerate(
+        for episode_offset, (episode_length, tasks) in enumerate(
             zip(episode_lengths, episode_tasks, strict=True)
         ):
+            episode_index = start_episode_index + episode_offset
             if episode_length <= 0:
                 raise ValueError(f"Episode {episode_index} length must be positive.")
             if len(tasks) != episode_length:
@@ -134,7 +194,7 @@ class DistributedWritePlan:
                 raise ValueError(f"Episode {episode_index} tasks must be non-empty strings.")
 
             for task in tasks:
-                task_to_index.setdefault(task, len(task_to_index))
+                task_mapping.setdefault(task, len(task_mapping))
 
             dataset_to_index = dataset_from_index + episode_length
             episodes.append(
@@ -143,7 +203,7 @@ class DistributedWritePlan:
                     dataset_from_index=dataset_from_index,
                     dataset_to_index=dataset_to_index,
                     tasks=tuple(tasks),
-                    task_indices=tuple(task_to_index[task] for task in tasks),
+                    task_indices=tuple(task_mapping[task] for task in tasks),
                     data_chunk_index=chunk_index,
                     data_file_index=file_index,
                 )
@@ -153,7 +213,7 @@ class DistributedWritePlan:
 
         return cls(
             episodes=tuple(episodes),
-            task_to_index=task_to_index,
+            task_to_index=task_mapping,
             chunks_size=chunks_size,
             video_keys=tuple(video_keys or ()),
         )
@@ -220,6 +280,7 @@ class DistributedWriteSession:
     @classmethod
     def resume(cls, root: str | Path) -> DistributedWriteSession:
         root = Path(root)
+        recover_distributed_metadata(root)
         plan_path = root / _SESSION_DIRECTORY / _PLAN_FILENAME
         if not plan_path.is_file():
             raise FileNotFoundError(f"Distributed write session plan is missing: {plan_path}")
@@ -237,11 +298,47 @@ class DistributedWriteSession:
     def result_path(self, episode_index: int) -> Path:
         return self.results_root / f"episode-{episode_index:06d}.json"
 
+    def episode_lock(self, spec: DistributedEpisodeSpec) -> FileLock:
+        # Keep lock inodes outside the disposable session directory. The filesystem
+        # must implement cross-node advisory locks; process death releases ownership.
+        lock_root = self.root / ".distributed-write-locks"
+        lock_root.mkdir(exist_ok=True)
+        return FileLock(lock_root / f"episode-{spec.episode_index:06d}.lock", timeout=0)
+
+    def require_active(self) -> None:
+        with (self.session_root / _PLAN_FILENAME).open(encoding="utf-8") as file:
+            current = _deserialize_plan(json.load(file)["plan"])
+        if current != self.plan:
+            raise ValueError("Distributed session no longer owns the active write plan.")
+
+    def reusable_result(self, spec: DistributedEpisodeSpec) -> DistributedEpisodeResult | None:
+        if _get_plan_spec(self.plan, spec.episode_index) != spec:
+            raise ValueError("Worker specification does not match its session plan.")
+        receipt = commit_receipt(self.root, self.plan)
+        if receipt.is_file():
+            with receipt.open(encoding="utf-8") as file:
+                payload = json.load(file)
+            result = next(
+                _deserialize_result(r) for r in payload["results"] if r["episode_index"] == spec.episode_index
+            )
+        else:
+            self.require_active()
+            path = self.result_path(spec.episode_index)
+            if not self._has_valid_result_record(spec, path):
+                return None
+            with path.open(encoding="utf-8") as file:
+                result = _deserialize_result(json.load(file))
+        _validate_persisted_result(
+            self.root, self.data_path_template, self.video_path_template, self.plan, spec, result
+        )
+        return result
+
     def pending_specs(self) -> list[DistributedEpisodeSpec]:
         completed = {result.episode_index for result in self.load_results()}
         return [spec for spec in self.plan.episodes if spec.episode_index not in completed]
 
     def record_result(self, result: DistributedEpisodeResult) -> None:
+        self.require_active()
         spec = _get_plan_spec(self.plan, result.episode_index)
         _validate_persisted_result(
             self.root,
@@ -255,6 +352,15 @@ class DistributedWriteSession:
 
     def load_results(self) -> list[DistributedEpisodeResult]:
         results = []
+        if commit_receipt(self.root, self.plan).is_file():
+            for spec in self.plan.episodes:
+                reused = self.reusable_result(spec)
+                if reused is None:
+                    raise ValueError(
+                        f"Committed distributed result is missing for episode {spec.episode_index}."
+                    )
+                results.append(reused)
+            return results
         for spec in self.plan.episodes:
             result_path = self.result_path(spec.episode_index)
             if not result_path.is_file():
@@ -275,9 +381,21 @@ class DistributedWriteSession:
     def cleanup_orphaned_artifacts(self) -> None:
         """Remove planned output paths for specs without a durable success record."""
         for spec in self.plan.episodes:
-            result_path = self.result_path(spec.episode_index)
-            if self._has_valid_result_record(spec, result_path):
-                continue
+            with self.episode_lock(spec):
+                self.cleanup_episode(spec)
+
+    def cleanup_episode(self, spec: DistributedEpisodeSpec) -> None:
+        """Clean one episode while its exclusive lock is held."""
+        if commit_receipt(self.root, self.plan).is_file():
+            return
+        self.require_active()
+        result_path = self.result_path(spec.episode_index)
+        for path in self.results_root.glob(f".{result_path.name}.*.tmp"):
+            path.unlink(missing_ok=True)
+        shutil.rmtree(
+            self.root / ".distributed-video-tmp" / f"episode-{spec.episode_index:06d}", ignore_errors=True
+        )
+        if not self._has_valid_result_record(spec, result_path):
             result_path.unlink(missing_ok=True)
             self._cleanup_spec_artifacts(spec)
 
@@ -337,6 +455,8 @@ class DistributedWriteSession:
         try:
             with temporary_path.open("x", encoding="utf-8") as file:
                 json.dump(payload, file, sort_keys=True)
+                file.flush()
+                os.fsync(file.fileno())
             os.replace(temporary_path, path)
         finally:
             temporary_path.unlink(missing_ok=True)
@@ -351,6 +471,7 @@ def _get_plan_spec(plan: DistributedWritePlan, episode_index: int) -> Distribute
 
 def _validate_result_matches_spec(spec: DistributedEpisodeSpec, result: DistributedEpisodeResult) -> None:
     expected_fields = (
+        ("episode_index", spec.episode_index),
         ("dataset_from_index", spec.dataset_from_index),
         ("dataset_to_index", spec.dataset_to_index),
         ("tasks", spec.tasks),
@@ -436,8 +557,8 @@ def validate_distributed_results(
 
     ordered_results = []
     for spec in plan.episodes:
-        result = result_by_episode.pop(spec.episode_index, None)
-        if result is None:
+        matched_result = result_by_episode.pop(spec.episode_index, None)
+        if matched_result is None:
             raise ValueError(f"Missing distributed result for episode {spec.episode_index}.")
         _validate_persisted_result(
             root,
@@ -445,9 +566,9 @@ def validate_distributed_results(
             video_path_template,
             plan,
             spec,
-            result,
+            matched_result,
         )
-        ordered_results.append(result)
+        ordered_results.append(matched_result)
 
     if result_by_episode:
         unknown = sorted(result_by_episode)
@@ -509,6 +630,22 @@ def _validate_persisted_result(
                 )
         if not expected_video_path.is_file():
             raise ValueError(f"Distributed video artifact is missing: {expected_video_path}")
+        try:
+            video_info = get_video_info(expected_video_path)
+            duration = get_video_duration_in_s(expected_video_path)
+        except Exception as error:
+            raise ValueError(f"Invalid distributed video artifact: {expected_video_path}") from error
+        expected_duration = spec.length / video_info["video.fps"]
+        if abs(duration - expected_duration) > 1 / video_info["video.fps"]:
+            raise ValueError(f"Unexpected distributed video duration: {expected_video_path}")
+        if not np.isclose(result.video_metadata.get(f"videos/{video_key}/from_timestamp", -1), 0):
+            raise ValueError(f"Invalid video start timestamp: {expected_video_path}")
+        if not np.isclose(result.video_metadata.get(f"videos/{video_key}/to_timestamp", -1), duration):
+            raise ValueError(f"Invalid video end timestamp: {expected_video_path}")
+    for relative_path, expected_digest in result.artifact_digests.items():
+        path = root / relative_path
+        if not path.is_file() or artifact_digest(path) != expected_digest:
+            raise ValueError(f"Distributed artifact checksum mismatch: {path}")
 
 
 def write_distributed_metadata(
@@ -516,12 +653,22 @@ def write_distributed_metadata(
     info: Any,
     plan: DistributedWritePlan,
     results: list[DistributedEpisodeResult],
+    *,
+    existing_metadata_root: Path | None = None,
+    existing_stats: dict[str, dict[str, np.ndarray]] | None = None,
 ) -> None:
     """Write complete global metadata below an unpublished staging root."""
+    base_total_episodes = info.total_episodes
+    base_total_frames = info.total_frames
+    if base_total_episodes:
+        if existing_metadata_root is None:
+            raise ValueError("Appending distributed metadata requires the existing dataset metadata root.")
+        shutil.copytree(existing_metadata_root / "meta", staging_root / "meta")
+
     tasks = pd.DataFrame(
         {"task_index": list(plan.task_to_index.values())},
         index=pd.Index(plan.task_to_index.keys(), name="task"),
-    )
+    ).sort_values("task_index")
     rows: list[dict[str, Any]] = []
     for result in results:
         flattened_stats = {
@@ -534,6 +681,8 @@ def write_distributed_metadata(
             "length": result.dataset_to_index - result.dataset_from_index,
             "data/chunk_index": result.data_chunk_index,
             "data/file_index": result.data_file_index,
+            "meta/episodes/chunk_index": result.data_chunk_index,
+            "meta/episodes/file_index": result.data_file_index,
             "dataset_from_index": result.dataset_from_index,
             "dataset_to_index": result.dataset_to_index,
             **flattened_stats,
@@ -542,10 +691,12 @@ def write_distributed_metadata(
         rows.append(row)
 
     staged_info = info
-    staged_info.total_episodes = len(results)
-    staged_info.total_frames = sum(result.dataset_to_index - result.dataset_from_index for result in results)
+    staged_info.total_episodes = base_total_episodes + len(results)
+    staged_info.total_frames = base_total_frames + sum(
+        result.dataset_to_index - result.dataset_from_index for result in results
+    )
     staged_info.total_tasks = len(tasks)
-    staged_info.splits = {"train": f"0:{len(results)}"}
+    staged_info.splits = {"train": f"0:{staged_info.total_episodes}"}
     if plan.video_keys:
         if staged_info.video_path is None:
             raise ValueError("Distributed plan includes videos but the dataset has no video path template.")
@@ -556,7 +707,8 @@ def write_distributed_metadata(
                     f"Distributed result for episode {first_result.episode_index} has no video info "
                     f"for {video_key!r}."
                 )
-            staged_info.features[video_key]["info"] = first_result.video_info[video_key]
+            if base_total_episodes == 0:
+                staged_info.features[video_key]["info"] = first_result.video_info[video_key]
 
     expected_depth_keys = {key for key, feature in staged_info.features.items() if is_depth_map(feature)}
     declared_depth_units = {
@@ -575,6 +727,18 @@ def write_distributed_metadata(
             depth_key: result.depth_units.get(depth_key) or declared_depth_units[depth_key]
             for depth_key in expected_depth_keys
         }
+        conflicting_declared_units = {
+            depth_key
+            for depth_key in expected_depth_keys
+            if result.depth_units.get(depth_key) is not None
+            and declared_depth_units[depth_key] is not None
+            and result.depth_units[depth_key] != declared_depth_units[depth_key]
+        }
+        if conflicting_declared_units:
+            raise ValueError(
+                f"Distributed result for episode {result.episode_index} disagrees with the existing "
+                f"depth unit for {sorted(conflicting_declared_units)!r}."
+            )
         missing_depth_keys = {
             depth_key for depth_key, depth_unit in effective_depth_units.items() if depth_unit is None
         }
@@ -601,7 +765,10 @@ def write_distributed_metadata(
 
     write_info(staged_info, staging_root)
     write_tasks(tasks, staging_root)
-    write_stats(aggregate_stats([result.stats for result in results]), staging_root)
+    stats_to_aggregate = [result.stats for result in results]
+    if existing_stats is not None:
+        stats_to_aggregate.insert(0, existing_stats)
+    write_stats(aggregate_stats(stats_to_aggregate), staging_root)
     for result, row in zip(results, rows, strict=True):
         path = staging_root / DEFAULT_EPISODES_PATH.format(
             chunk_index=result.data_chunk_index,
@@ -622,9 +789,23 @@ def _normalize_metadata_stat_value(value: Any) -> Any:
 
 
 def publish_distributed_metadata(root: Path, staging_root: Path) -> None:
-    """Atomically publish staged metadata while retaining rollback on failure."""
+    """Publish metadata with a persistent recovery journal (single driver)."""
+    with FileLock(root / ".distributed-metadata.lock"):
+        _publish_distributed_metadata(root, staging_root)
+
+
+def _publish_distributed_metadata(root: Path, staging_root: Path) -> None:
+    journal = root / ".distributed-metadata-publish.json"
+    if journal.exists():
+        with journal.open(encoding="utf-8") as file:
+            previous_source = json.load(file)["source"]
+        published = _recover_distributed_metadata(root)
+        if published and previous_source == str(staging_root.relative_to(root) / "meta"):
+            return
     source_meta = staging_root / "meta"
     destination_meta = root / "meta"
+    if not source_meta.is_dir():
+        raise FileNotFoundError(f"Staged distributed metadata is missing: {source_meta}")
     if not destination_meta.is_dir():
         raise FileNotFoundError(
             f"Cannot publish distributed metadata because {destination_meta} is missing. "
@@ -632,6 +813,13 @@ def publish_distributed_metadata(root: Path, staging_root: Path) -> None:
             f"Staged metadata remains at {source_meta}."
         )
     backup_meta = root / f".meta-distributed-backup-{uuid4().hex}"
+    DistributedWriteSession._write_json_atomically(
+        journal,
+        {
+            "source": str(source_meta.relative_to(root)),
+            "backup": backup_meta.name,
+        },
+    )
     backup_restored = False
     try:
         os.replace(destination_meta, backup_meta)
@@ -644,3 +832,36 @@ def publish_distributed_metadata(root: Path, staging_root: Path) -> None:
     finally:
         if destination_meta.exists() or backup_restored:
             shutil.rmtree(backup_meta, ignore_errors=True)
+            journal.unlink(missing_ok=True)
+
+
+def recover_distributed_metadata(root: Path) -> bool:
+    """Recover a metadata swap; return whether staged metadata was published."""
+    with FileLock(root / ".distributed-metadata.lock"):
+        return _recover_distributed_metadata(root)
+
+
+def _recover_distributed_metadata(root: Path) -> bool:
+    journal = root / ".distributed-metadata-publish.json"
+    if not journal.is_file():
+        return False
+    with journal.open(encoding="utf-8") as file:
+        state = json.load(file)
+    source = root / state["source"]
+    backup = root / state["backup"]
+    destination = root / "meta"
+    published = True
+    if source.is_dir():
+        if destination.exists():
+            if backup.exists():
+                raise RuntimeError("Ambiguous distributed metadata recovery state; preserving all copies.")
+            os.replace(destination, backup)
+        os.replace(source, destination)
+    elif not destination.exists():
+        if not backup.is_dir():
+            raise RuntimeError("Distributed metadata recovery has neither staged nor backup metadata.")
+        os.replace(backup, destination)
+        published = False
+    shutil.rmtree(backup, ignore_errors=True)
+    journal.unlink()
+    return published
