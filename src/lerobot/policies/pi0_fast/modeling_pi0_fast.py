@@ -18,7 +18,7 @@ import builtins
 import logging
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, Any, TypedDict, Unpack, cast
 
 import numpy as np
 import torch
@@ -56,6 +56,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
 )
 
+from ..common.openpi_checkpoint import building_on_meta, load_complete_checkpoint
 from ..common.vla_utils import pad_vector, prepare_attention_masks_4d, resize_with_pad_torch
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
@@ -749,6 +750,8 @@ class PI0FastPolicy(PreTrainedPolicy):
 
     config_class = PI0FastConfig
     name = "pi0_fast"
+    # Read from this class only, so each subclass opts in on its own.
+    _supports_meta_load = True
 
     def __init__(
         self,
@@ -793,7 +796,9 @@ class PI0FastPolicy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # When load_complete_checkpoint builds the policy, it places the parameters and moves the buffers.
+        if not building_on_meta():
+            self.model.to(config.device)
 
         self.reset()
 
@@ -822,19 +827,30 @@ class PI0FastPolicy(PreTrainedPolicy):
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
 
+        download_kwargs: dict[str, Any] = {
+            "force_download": force_download,
+            "resume_download": resume_download,
+            "proxies": proxies,
+            "token": token,
+            "cache_dir": cache_dir,
+            "local_files_only": local_files_only,
+            "revision": revision,
+        }
         # Use provided config if available, otherwise create default config
         if config is None:
             config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                **kwargs,
+                pretrained_name_or_path=pretrained_name_or_path, **download_kwargs, **kwargs
             )
+
+        print(f"Loading model from: {pretrained_name_or_path}")
+        require_package("transformers", extra="pi")
+        require_package("scipy", extra="pi")
+        from transformers.utils import cached_file
+
+        resolved_file = cached_file(pretrained_name_or_path, "model.safetensors", **download_kwargs)
+        model = load_complete_checkpoint(cls, resolved_file, config, **kwargs)
+        if model is not None:
+            return model
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
@@ -842,47 +858,17 @@ class PI0FastPolicy(PreTrainedPolicy):
 
         # Load state dict (expects keys with "model." prefix)
         try:
-            print(f"Loading model from: {pretrained_name_or_path}")
             try:
-                from transformers.utils import cached_file
-
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
+                print(f"Could not load state dict from {resolved_file}: {e}")
                 print("Returning model without loading pretrained weights")
                 return model
 
-            # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
-
-            # Then add "model." prefix for all keys that don't already have it
-            remapped_state_dict = {}
-            remap_count = 0
-
-            for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
-                    new_key = f"model.{key}"
-                    remapped_state_dict[new_key] = value
-                    remap_count += 1
-                else:
-                    remapped_state_dict[key] = value
-
-            if remap_count > 0:
-                print(f"Remapped {remap_count} state dict keys")
+            remapped_state_dict = model._convert_openpi_state_dict(original_state_dict)
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
@@ -915,6 +901,28 @@ class PI0FastPolicy(PreTrainedPolicy):
 
         return model
 
+    def _convert_openpi_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Map an OpenPI-format checkpoint (e.g. ``lerobot/pi0fast-base``) onto this policy's keys."""
+        # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
+        fixed_state_dict = self._fix_pytorch_state_dict_keys(state_dict, self.config)
+
+        # Then add "model." prefix for all keys that don't already have it
+        remapped_state_dict = {}
+        remap_count = 0
+
+        for key, value in fixed_state_dict.items():
+            if not key.startswith("model."):
+                new_key = f"model.{key}"
+                remapped_state_dict[new_key] = value
+                remap_count += 1
+            else:
+                remapped_state_dict[key] = value
+
+        if remap_count > 0:
+            print(f"Remapped {remap_count} state dict keys")
+
+        return remapped_state_dict
+
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
     ):  # see openpi `BaseModelConfig, _fix_pytorch_state_dict_keys`
@@ -934,9 +942,11 @@ class PI0FastPolicy(PreTrainedPolicy):
                 key == "model.paligemma_with_expert.paligemma.lm_head.weight"
                 or key == "paligemma_with_expert.paligemma.lm_head.weight"
             ):
+                # Every caller copies each value into its own parameter, so no clone is needed. Until then
+                # the two keys share one tensor, so a conversion step must not edit it in place.
                 fixed_state_dict[
                     "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
-                ] = value.clone()
+                ] = value
 
             fixed_state_dict[new_key] = value
 
