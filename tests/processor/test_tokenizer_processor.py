@@ -18,6 +18,11 @@
 Tests for the TokenizerProcessorStep class.
 """
 
+import json
+import logging
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +34,7 @@ from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeatur
 from lerobot.lerobot_types import TransitionKey
 from lerobot.processor import ActionTokenizerProcessorStep, DataProcessorPipeline, TokenizerProcessorStep
 from lerobot.processor.converters import create_transition, identity_transition
+from lerobot.processor.tokenizer_processor import load_action_tokenizer
 from lerobot.utils.constants import (
     ACTION,
     OBS_IMAGE,
@@ -37,6 +43,7 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_SUBTASK_TOKENS,
     OBS_STATE,
 )
+from lerobot.utils.import_utils import _require_package_cache
 from tests.utils import skip_if_package_missing
 
 
@@ -132,6 +139,202 @@ def test_action_tokenizer_can_reject_truncated_sequences():
 
     with pytest.raises(ValueError, match="max_action_tokens=4"):
         processor._tokenize_action(torch.zeros(1, 2, 1))
+
+
+_ACTION_PROCESSOR_CODE = """
+from transformers import ProcessorMixin
+
+
+class TinyActionProcessor(ProcessorMixin):
+    bpe_tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, bpe_tokenizer, scale=10):
+        self.scale = scale
+        super().__init__(bpe_tokenizer)
+"""
+
+
+def _save_tiny_tokenizer(folder: Path) -> None:
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = Tokenizer(models.WordLevel({"a": 0, "b": 1, "[UNK]": 2}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer).save_pretrained(folder)
+
+
+def _save_action_processor(
+    folder: Path, tokenizer_subfolder: str, code: str | None = _ACTION_PROCESSOR_CODE
+) -> None:
+    """Saves a FAST-like processor with its tokenizer in `tokenizer_subfolder` and remote `code` if given."""
+    folder.mkdir()
+    processor_config = {"processor_class": "TinyActionProcessor", "scale": 7}
+    if code is not None:
+        (folder / "processing_tiny.py").write_text(code)
+        processor_config["auto_map"] = {"AutoProcessor": "processing_tiny.TinyActionProcessor"}
+    (folder / "processor_config.json").write_text(json.dumps(processor_config))
+    _save_tiny_tokenizer(folder / tokenizer_subfolder)
+
+
+def _assert_tiny_action_processor(processor) -> None:
+    assert processor.scale == 7
+    assert processor.bpe_tokenizer.encode("b a", add_special_tokens=False) == [1, 0]
+
+
+@skip_if_package_missing("transformers")
+@pytest.mark.parametrize("error", [ImportError, ValueError], ids=["import_error", "value_error"])
+def test_action_tokenizer_falls_back_on_either_auto_processor_error(tmp_path, monkeypatch, caplog, error):
+    """The old layout fails with ImportError without protobuf and with ValueError with it, so cover both."""
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    source = tmp_path / "legacy_fast"
+    _save_action_processor(source, tokenizer_subfolder="")
+    _save_tiny_tokenizer(tmp_path / "text")
+
+    with patch("lerobot.processor.tokenizer_processor.AutoProcessor") as auto_processor:
+        auto_processor.from_pretrained.side_effect = error("AutoProcessor failed")
+        with caplog.at_level(logging.WARNING):
+            step = ActionTokenizerProcessorStep(
+                action_tokenizer_name=str(source), paligemma_tokenizer_name=str(tmp_path / "text")
+            )
+    _assert_tiny_action_processor(step.action_tokenizer)
+    assert "save the loaded processor with save_pretrained()" in caplog.text
+
+    # The mocked AutoProcessor registered nothing, so the saved copy has its code only if the fallback did.
+    artifact = step.save_artifacts(tmp_path / "saved")["action_tokenizer_name"]
+    saved = ActionTokenizerProcessorStep(
+        action_tokenizer_name=str(tmp_path / "saved" / artifact),
+        paligemma_tokenizer_name=str(tmp_path / "text"),
+    )
+    _assert_tiny_action_processor(saved.action_tokenizer)
+
+
+@skip_if_package_missing("transformers")
+def test_legacy_action_tokenizer_saved_artifact_is_portable(tmp_path, monkeypatch):
+    """The saved copy loads offline in a new process, without the original folder or module cache."""
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    source = tmp_path / "legacy_fast"
+    _save_action_processor(source, tokenizer_subfolder="")
+    _save_tiny_tokenizer(tmp_path / "text")
+    # The real AutoProcessor registers the class before it fails, so only the fallback registers it here.
+    with patch("lerobot.processor.tokenizer_processor.AutoProcessor") as auto_processor:
+        auto_processor.from_pretrained.side_effect = ValueError("AutoProcessor failed")
+        step = ActionTokenizerProcessorStep(
+            action_tokenizer_name=str(source), paligemma_tokenizer_name=str(tmp_path / "text")
+        )
+    artifact = step.save_artifacts(tmp_path / "saved")["action_tokenizer_name"]
+    source.rename(tmp_path / "original_moved")
+    (tmp_path / "saved").rename(tmp_path / "relocated")
+    script = """
+import sys
+from lerobot.processor import ActionTokenizerProcessorStep
+step = ActionTokenizerProcessorStep(action_tokenizer_name=sys.argv[1], paligemma_tokenizer_name=sys.argv[2])
+assert step.action_tokenizer.scale == 7
+assert step.action_tokenizer.bpe_tokenizer.encode("b a", add_special_tokens=False) == [1, 0]
+"""
+    env = dict(os.environ, HF_MODULES_CACHE=str(tmp_path / "fresh_modules"), HF_HUB_OFFLINE="1")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "relocated" / artifact), str(tmp_path / "text")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_respects_trust_remote_code_for_transformers_4_layout(tmp_path, monkeypatch):
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    marker = tmp_path / "remote_code_ran"
+    code = _ACTION_PROCESSOR_CODE + f"\nimport pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+    _save_action_processor(tmp_path / "legacy_fast", tokenizer_subfolder="", code=code)
+    _save_tiny_tokenizer(tmp_path / "text")
+
+    with pytest.raises(ValueError, match="trust_remote_code=True"):
+        ActionTokenizerProcessorStep(
+            action_tokenizer_name=str(tmp_path / "legacy_fast"),
+            paligemma_tokenizer_name=str(tmp_path / "text"),
+            trust_remote_code=False,
+        )
+    assert not marker.exists()
+
+
+@skip_if_package_missing("transformers")
+def test_action_tokenizer_keeps_auto_processor_error_with_broken_bpe_tokenizer_folder(tmp_path, monkeypatch):
+    """Stale top-level files must not replace a `bpe_tokenizer/` that fails to load."""
+    import transformers.dynamic_module_utils
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    folder = tmp_path / "half_moved"
+    _save_action_processor(folder, tokenizer_subfolder="")
+    (folder / "bpe_tokenizer").mkdir()
+    (folder / "bpe_tokenizer" / "tokenizer.json").write_text("{")
+
+    with patch("lerobot.processor.tokenizer_processor.AutoProcessor") as auto_processor:
+        auto_processor.from_pretrained.side_effect = ValueError("AutoProcessor failed")
+        with pytest.raises(ValueError, match="AutoProcessor failed"):
+            load_action_tokenizer(str(folder), trust_remote_code=True)
+
+
+@skip_if_package_missing("transformers")
+def test_load_action_tokenizer_keeps_auto_processor_error_when_fallback_fails(tmp_path):
+    error = ValueError("AutoProcessor failed")
+    error.__cause__ = KeyError("cause of the AutoProcessor error")
+    with (
+        patch("lerobot.processor.tokenizer_processor.AutoProcessor") as auto_processor,
+        patch(
+            "lerobot.processor.tokenizer_processor._load_fast_processor_saved_by_transformers_4",
+            side_effect=OSError("fallback failed"),
+        ),
+    ):
+        auto_processor.from_pretrained.side_effect = error
+        with pytest.raises(ValueError) as raised:
+            load_action_tokenizer(str(tmp_path), trust_remote_code=True)
+    assert raised.value is error
+    assert isinstance(error.__cause__, KeyError)
+    assert len(error.__notes__) == 1
+    assert "OSError: fallback failed" in error.__notes__[0]
+
+
+def test_load_action_tokenizer_names_the_extra_when_transformers_is_missing(tmp_path):
+    with patch("lerobot.utils.import_utils.is_package_available", return_value=False):
+        _require_package_cache.clear()
+        try:
+            with pytest.raises(ImportError, match=r"lerobot\[transformers-dep\]"):
+                load_action_tokenizer(str(tmp_path), trust_remote_code=True)
+        finally:
+            _require_package_cache.clear()
+
+
+@skip_if_package_missing("transformers")
+def test_wall_x_loads_action_tokenizer_saved_by_transformers_4(tmp_path, monkeypatch):
+    import transformers.dynamic_module_utils
+
+    from lerobot.policies.wall_x.processor_wall_x import WallXTokenizerStep
+
+    monkeypatch.setattr(transformers.dynamic_module_utils, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    _save_action_processor(tmp_path / "legacy_fast", tokenizer_subfolder="")
+    _save_tiny_tokenizer(tmp_path / "text")
+    step = WallXTokenizerStep(
+        processor_name=str(tmp_path / "text"),
+        image_keys=[],
+        chunk_size=1,
+        max_state_dim=1,
+        max_action_dim=1,
+        output_action_dim=1,
+        use_fast_tokenizer=True,
+        action_tokenizer_name=str(tmp_path / "legacy_fast"),
+    )
+
+    _, action_tokenizer = step._get_processors()
+
+    _assert_tiny_action_processor(action_tokenizer)
 
 
 @pytest.fixture
