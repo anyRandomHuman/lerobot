@@ -37,7 +37,7 @@ from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
 def main():
     # Browse datasets created/ported by the community on the hub using the hub api:
     hub_api = HfApi()
-    repo_ids = [info.id for info in hub_api.list_datasets(task_categories="robotics", tags=["LeRobot"])]
+    repo_ids = [info.id for info in hub_api.list_datasets(task_categories="robotics", filter="LeRobot")]
     pprint(repo_ids)
 
     # Or simply explore them in your web browser directly at:
@@ -67,7 +67,7 @@ def main():
 
     # You can then load the actual dataset from the hub.
     # Either load any subset of episodes:
-    dataset = LeRobotDataset(repo_id, episodes=[0, 10, 11, 23])
+    dataset = LeRobotDataset(repo_id, episodes=[0])
 
     # And see how many frames you have:
     print(f"Selected episodes: {dataset.episodes}")
@@ -75,9 +75,9 @@ def main():
     print(f"Number of frames selected: {dataset.num_frames}")
 
     # Or simply load the entire dataset:
-    dataset = LeRobotDataset(repo_id)
-    print(f"Number of episodes selected: {dataset.num_episodes}")
-    print(f"Number of frames selected: {dataset.num_frames}")
+    # dataset = LeRobotDataset(repo_id)
+    # print(f"Number of episodes selected: {dataset.num_episodes}")
+    # print(f"Number of frames selected: {dataset.num_frames}")
 
     # The previous metadata class is contained in the 'meta' attribute of the dataset:
     print(dataset.meta)
@@ -93,6 +93,7 @@ def main():
     episode_index = 0
     from_idx = dataset.meta.episodes["dataset_from_index"][episode_index]
     to_idx = dataset.meta.episodes["dataset_to_index"][episode_index]
+    to_idx = min(to_idx, from_idx + 10)  # let's limit to 10 frames for this example
 
     # Then we grab all the image frames from the first camera:
     camera_key = dataset.meta.camera_keys[0]
@@ -123,7 +124,7 @@ def main():
     # Note that in any case, these delta_timestamps values need to be multiples of (1/fps) so that added to any
     # timestamp, you still get a valid timestamp.
 
-    dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps)
+    dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps, episodes=[0])
     print(f"\n{dataset[0][camera_key].shape=}")  # (4, c, h, w)
     print(f"{dataset[0]['observation.state'].shape=}")  # (6, c)
     print(f"{dataset[0]['action'].shape=}\n")  # (64, c)
