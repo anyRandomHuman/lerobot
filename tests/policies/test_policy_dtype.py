@@ -50,6 +50,8 @@ def test_policy_config_json_round_trip(tmp_path, config_cls):
 
 
 def test_train_config_cli_and_resume(tmp_path):
+    # draccus.parse, called directly, finds only the policies that are registered.
+    PreTrainedConfig.load_all_choices()
     cfg = draccus.parse(
         TrainPipelineConfig, args=["--dataset.repo_id=u/d", "--policy.type=act", "--policy.dtype=bfloat16"]
     )
