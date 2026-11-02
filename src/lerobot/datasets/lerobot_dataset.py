@@ -17,7 +17,7 @@ import contextlib
 import json
 import logging
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast, overload
@@ -39,6 +39,7 @@ from .dataset_writer import DatasetWriter
 from .distributed import (
     DistributedEpisodeResult,
     DistributedEpisodeSpec,
+    DistributedShardSpec,
     DistributedWritePlan,
     DistributedWriteSession,
     commit_receipt,
@@ -49,6 +50,7 @@ from .distributed import (
     write_commit_receipt,
     write_distributed_metadata,
 )
+from .distributed_writer import write_distributed_shard
 from .storage import (
     DEFAULT_STORAGE_FORMAT,
     dataset_location,
@@ -634,6 +636,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         *,
         episode_lengths: list[int],
         episode_tasks: list[list[str]],
+        max_frames_per_worker: int = 100_000,
+        pack_episodes: bool = True,
     ) -> DistributedWritePlan:
         """Allocate a distributed batch after the dataset's currently published episodes."""
         self._require_writer("create_distributed_write_plan")
@@ -650,7 +654,30 @@ class LeRobotDataset(torch.utils.data.Dataset):
             start_chunk_index=start_chunk_index,
             start_file_index=start_file_index,
             task_to_index=self._distributed_task_mapping(),
+            max_frames_per_worker=max_frames_per_worker,
+            pack_episodes=pack_episodes,
+            data_files_size_in_mb=self.meta.data_files_size_in_mb if pack_episodes else None,
+            video_files_size_in_mb=self.meta.video_files_size_in_mb if pack_episodes else None,
         )
+
+    def write_distributed_shard(
+        self, shard: DistributedShardSpec, episodes: Iterable[Iterable[dict]]
+    ) -> list[DistributedEpisodeResult]:
+        """Write one task with a single Parquet and one MP4 per video feature.
+
+        ``episodes`` supplies frame iterables in plan order. Size targets are
+        checked after each complete episode; the input suffix is left untouched
+        and exposed by session.pending_shards() as a new schedulable task. The
+        returned results cover only this task's completed prefix. Retries reuse
+        its durable boundary and verified results. Requires a persistent session.
+        """
+        writer = self._require_writer("write_distributed_shard")
+        session = getattr(self, "_distributed_write_session", None)
+        if session is None or not getattr(self, "_is_distributed_writer", False):
+            raise ValueError("write_distributed_shard() requires open_distributed_writer(session=...).")
+        if self.has_pending_frames() or getattr(self, "_distributed_episode_lock", None) is not None:
+            raise RuntimeError("Finish the active episode before writing a distributed shard.")
+        return write_distributed_shard(writer, session, shard, episodes)
 
     def _distributed_task_mapping(self) -> dict[str, int]:
         if self.meta.tasks is None:
@@ -685,6 +712,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return update_chunk_file_indices(*max(occupied_slots), self.meta.chunks_size)
 
     def _validate_distributed_plan_base(self, plan: DistributedWritePlan) -> None:
+        if not plan.episodes:
+            raise ValueError("Distributed plan must contain episodes.")
+        if plan.shards:
+            if tuple(spec for shard in plan.shards for spec in shard.episodes) != plan.episodes:
+                raise ValueError("Distributed shards must cover the plan's episodes exactly once, in order.")
+            if any(not shard.episodes for shard in plan.shards):
+                raise ValueError("Distributed shards must not be empty.")
+            if plan.chunks_size != self.meta.chunks_size:
+                raise ValueError("Distributed plan chunks_size differs from the dataset.")
+            for field in ("data_files_size_in_mb", "video_files_size_in_mb"):
+                limit = getattr(plan, field)
+                if limit is not None and limit != getattr(self.meta, field):
+                    raise ValueError(f"Distributed plan {field} differs from the dataset.")
         first_spec = plan.episodes[0]
         if first_spec.episode_index != self.meta.total_episodes:
             raise ValueError(
@@ -839,6 +879,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return
         if session.plan == plan:
+            for shard in session.task_specs():
+                # A worker can die after its success record, before cleaning its
+                # staging directory. Committed tasks can no longer write there.
+                shutil.rmtree(session.shard_staging_root(shard), ignore_errors=True)
             shutil.rmtree(session.session_root, ignore_errors=True)
 
     def clear_episode_buffer(self, delete_images: bool = True) -> None:
